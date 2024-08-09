@@ -1,29 +1,44 @@
-import { create } from "zustand";
-import { persist } from "zustand/middleware";
-
-import { trimTopic } from "../utils";
+import { trimTopic, getMessageTextContent } from "../utils";
 
 import Locale, { getLang } from "../locales";
 import { showToast } from "../components/ui-lib";
 import { ModelConfig, ModelType, useAppConfig } from "./config";
 import { createEmptyMask, Mask } from "./mask";
-import { DEFAULT_INPUT_TEMPLATE, StoreKey } from "../constant";
-import { api, RequestMessage } from "../client/api";
+import {
+  DEFAULT_INPUT_TEMPLATE,
+  DEFAULT_MODELS,
+  DEFAULT_SYSTEM_TEMPLATE,
+  KnowledgeCutOffDate,
+  StoreKey,
+  SUMMARIZE_MODEL,
+  GEMINI_SUMMARIZE_MODEL,
+} from "../constant";
+import { getClientApi } from "../client/api";
+import type {
+  ClientApi,
+  RequestMessage,
+  MultimodalContent,
+} from "../client/api";
 import { ChatControllerPool } from "../client/controller";
 import { prettyObject } from "../utils/format";
 import { estimateTokenLength } from "../utils/token";
+import { nanoid } from "nanoid";
+import { createPersistStore } from "../utils/store";
+import { collectModelsWithDefaultModel } from "../utils/model";
+import { useAccessStore } from "./access";
+import { isDalle3 } from "../utils";
 
 export type ChatMessage = RequestMessage & {
   date: string;
   streaming?: boolean;
   isError?: boolean;
-  id?: number;
+  id: string;
   model?: ModelType;
 };
 
 export function createMessage(override: Partial<ChatMessage>): ChatMessage {
   return {
-    id: Date.now(),
+    id: nanoid(),
     date: new Date().toLocaleString(),
     role: "user",
     content: "",
@@ -38,7 +53,7 @@ export interface ChatStat {
 }
 
 export interface ChatSession {
-  id: number;
+  id: string;
   topic: string;
 
   memoryPrompt: string;
@@ -59,7 +74,7 @@ export const BOT_HELLO: ChatMessage = createMessage({
 
 function createEmptySession(): ChatSession {
   return {
-    id: Date.now() + Math.random(),
+    id: nanoid(),
     topic: DEFAULT_TOPIC,
     memoryPrompt: "",
     messages: [],
@@ -75,47 +90,63 @@ function createEmptySession(): ChatSession {
   };
 }
 
-interface ChatStore {
-  sessions: ChatSession[];
-  currentSessionIndex: number;
-  globalId: number;
-  clearSessions: () => void;
-  moveSession: (from: number, to: number) => void;
-  selectSession: (index: number) => void;
-  newSession: (mask?: Mask) => void;
-  deleteSession: (index: number) => void;
-  currentSession: () => ChatSession;
-  nextSession: (delta: number) => void;
-  onNewMessage: (message: ChatMessage) => void;
-  onUserInput: (content: string) => Promise<void>;
-  summarizeSession: () => void;
-  updateStat: (message: ChatMessage) => void;
-  updateCurrentSession: (updater: (session: ChatSession) => void) => void;
-  updateMessage: (
-    sessionIndex: number,
-    messageIndex: number,
-    updater: (message?: ChatMessage) => void,
-  ) => void;
-  resetSession: () => void;
-  getMessagesWithMemory: () => ChatMessage[];
-  getMemoryPrompt: () => ChatMessage;
-
-  clearAllData: () => void;
+function getSummarizeModel(currentModel: string) {
+  // if it is using gpt-* models, force to use 4o-mini to summarize
+  if (currentModel.startsWith("gpt")) {
+    const configStore = useAppConfig.getState();
+    const accessStore = useAccessStore.getState();
+    const allModel = collectModelsWithDefaultModel(
+      configStore.models,
+      [configStore.customModels, accessStore.customModels].join(","),
+      accessStore.defaultModel,
+    );
+    const summarizeModel = allModel.find(
+      (m) => m.name === SUMMARIZE_MODEL && m.available,
+    );
+    return summarizeModel?.name ?? currentModel;
+  }
+  if (currentModel.startsWith("gemini")) {
+    return GEMINI_SUMMARIZE_MODEL;
+  }
+  return currentModel;
 }
 
 function countMessages(msgs: ChatMessage[]) {
-  return msgs.reduce((pre, cur) => pre + estimateTokenLength(cur.content), 0);
+  return msgs.reduce(
+    (pre, cur) => pre + estimateTokenLength(getMessageTextContent(cur)),
+    0,
+  );
 }
 
 function fillTemplateWith(input: string, modelConfig: ModelConfig) {
+  const cutoff =
+    KnowledgeCutOffDate[modelConfig.model] ?? KnowledgeCutOffDate.default;
+  // Find the model in the DEFAULT_MODELS array that matches the modelConfig.model
+  const modelInfo = DEFAULT_MODELS.find((m) => m.name === modelConfig.model);
+
+  var serviceProvider = "OpenAI";
+  if (modelInfo) {
+    // TODO: auto detect the providerName from the modelConfig.model
+
+    // Directly use the providerName from the modelInfo
+    serviceProvider = modelInfo.provider.providerName;
+  }
+
   const vars = {
+    ServiceProvider: serviceProvider,
+    cutoff,
     model: modelConfig.model,
-    time: new Date().toLocaleString(),
+    time: new Date().toString(),
     lang: getLang(),
     input: input,
   };
 
   let output = modelConfig.template ?? DEFAULT_INPUT_TEMPLATE;
+
+  // remove duplicate
+  if (input.startsWith(output)) {
+    output = "";
+  }
 
   // must contains {{input}}
   const inputVar = "{{input}}";
@@ -124,19 +155,29 @@ function fillTemplateWith(input: string, modelConfig: ModelConfig) {
   }
 
   Object.entries(vars).forEach(([name, value]) => {
-    output = output.replaceAll(`{{${name}}}`, value);
+    const regex = new RegExp(`{{${name}}}`, "g");
+    output = output.replace(regex, value.toString()); // Ensure value is a string
   });
 
   return output;
 }
 
-export const useChatStore = create<ChatStore>()(
-  persist(
-    (set, get) => ({
-      sessions: [createEmptySession()],
-      currentSessionIndex: 0,
-      globalId: 0,
+const DEFAULT_CHAT_STATE = {
+  sessions: [createEmptySession()],
+  currentSessionIndex: 0,
+};
 
+export const useChatStore = createPersistStore(
+  DEFAULT_CHAT_STATE,
+  (set, _get) => {
+    function get() {
+      return {
+        ..._get(),
+        ...methods,
+      };
+    }
+
+    const methods = {
       clearSessions() {
         set(() => ({
           sessions: [createEmptySession()],
@@ -175,11 +216,8 @@ export const useChatStore = create<ChatStore>()(
         });
       },
 
-      newSession(mask) {
+      newSession(mask?: Mask) {
         const session = createEmptySession();
-
-        set(() => ({ globalId: get().globalId + 1 }));
-        session.id = get().globalId;
 
         if (mask) {
           const config = useAppConfig.getState();
@@ -201,14 +239,14 @@ export const useChatStore = create<ChatStore>()(
         }));
       },
 
-      nextSession(delta) {
+      nextSession(delta: number) {
         const n = get().sessions.length;
         const limit = (x: number) => (x + n) % n;
         const i = get().currentSessionIndex;
         get().selectSession(limit(i + delta));
       },
 
-      deleteSession(index) {
+      deleteSession(index: number) {
         const deletingLastSession = get().sessions.length === 1;
         const deletedSession = get().sessions.at(index);
 
@@ -265,7 +303,7 @@ export const useChatStore = create<ChatStore>()(
         return session;
       },
 
-      onNewMessage(message) {
+      onNewMessage(message: ChatMessage) {
         get().updateCurrentSession((session) => {
           session.messages = session.messages.concat();
           session.lastUpdate = Date.now();
@@ -274,36 +312,54 @@ export const useChatStore = create<ChatStore>()(
         get().summarizeSession();
       },
 
-      async onUserInput(content) {
+      async onUserInput(content: string, attachImages?: string[]) {
         const session = get().currentSession();
         const modelConfig = session.mask.modelConfig;
 
         const userContent = fillTemplateWith(content, modelConfig);
-        console.log("[User Input] fill with template: ", userContent);
+        console.log("[User Input] after template: ", userContent);
 
-        const userMessage: ChatMessage = createMessage({
+        let mContent: string | MultimodalContent[] = userContent;
+
+        if (attachImages && attachImages.length > 0) {
+          mContent = [
+            {
+              type: "text",
+              text: userContent,
+            },
+          ];
+          mContent = mContent.concat(
+            attachImages.map((url) => {
+              return {
+                type: "image_url",
+                image_url: {
+                  url: url,
+                },
+              };
+            }),
+          );
+        }
+        let userMessage: ChatMessage = createMessage({
           role: "user",
-          content: userContent,
+          content: mContent,
         });
 
         const botMessage: ChatMessage = createMessage({
           role: "assistant",
           streaming: true,
-          id: userMessage.id! + 1,
           model: modelConfig.model,
         });
 
         // get recent messages
         const recentMessages = get().getMessagesWithMemory();
         const sendMessages = recentMessages.concat(userMessage);
-        const sessionIndex = get().currentSessionIndex;
         const messageIndex = get().currentSession().messages.length + 1;
 
         // save user's and bot's message
         get().updateCurrentSession((session) => {
           const savedUserMessage = {
             ...userMessage,
-            content,
+            content: mContent,
           };
           session.messages = session.messages.concat([
             savedUserMessage,
@@ -311,8 +367,8 @@ export const useChatStore = create<ChatStore>()(
           ]);
         });
 
+        const api: ClientApi = getClientApi(modelConfig.providerName);
         // make request
-        console.log("[User Input] ", sendMessages);
         api.llm.chat({
           messages: sendMessages,
           config: { ...modelConfig, stream: true },
@@ -331,14 +387,11 @@ export const useChatStore = create<ChatStore>()(
               botMessage.content = message;
               get().onNewMessage(botMessage);
             }
-            ChatControllerPool.remove(
-              sessionIndex,
-              botMessage.id ?? messageIndex,
-            );
+            ChatControllerPool.remove(session.id, botMessage.id);
           },
           onError(error) {
             const isAborted = error.message.includes("aborted");
-            botMessage.content =
+            botMessage.content +=
               "\n\n" +
               prettyObject({
                 error: true,
@@ -351,7 +404,7 @@ export const useChatStore = create<ChatStore>()(
               session.messages = session.messages.concat();
             });
             ChatControllerPool.remove(
-              sessionIndex,
+              session.id,
               botMessage.id ?? messageIndex,
             );
 
@@ -360,7 +413,7 @@ export const useChatStore = create<ChatStore>()(
           onController(controller) {
             // collect controller for stop/retry
             ChatControllerPool.addController(
-              sessionIndex,
+              session.id,
               botMessage.id ?? messageIndex,
               controller,
             );
@@ -371,14 +424,13 @@ export const useChatStore = create<ChatStore>()(
       getMemoryPrompt() {
         const session = get().currentSession();
 
-        return {
-          role: "system",
-          content:
-            session.memoryPrompt.length > 0
-              ? Locale.Store.Prompt.History(session.memoryPrompt)
-              : "",
-          date: "",
-        } as ChatMessage;
+        if (session.memoryPrompt.length) {
+          return {
+            role: "system",
+            content: Locale.Store.Prompt.History(session.memoryPrompt),
+            date: "",
+          } as ChatMessage;
+        }
       },
 
       getMessagesWithMemory() {
@@ -391,15 +443,38 @@ export const useChatStore = create<ChatStore>()(
         // in-context prompts
         const contextPrompts = session.mask.context.slice();
 
+        // system prompts, to get close to OpenAI Web ChatGPT
+        const shouldInjectSystemPrompts =
+          modelConfig.enableInjectSystemPrompts &&
+          session.mask.modelConfig.model.startsWith("gpt-");
+
+        var systemPrompts: ChatMessage[] = [];
+        systemPrompts = shouldInjectSystemPrompts
+          ? [
+              createMessage({
+                role: "system",
+                content: fillTemplateWith("", {
+                  ...modelConfig,
+                  template: DEFAULT_SYSTEM_TEMPLATE,
+                }),
+              }),
+            ]
+          : [];
+        if (shouldInjectSystemPrompts) {
+          console.log(
+            "[Global System Prompt] ",
+            systemPrompts.at(0)?.content ?? "empty",
+          );
+        }
+        const memoryPrompt = get().getMemoryPrompt();
         // long term memory
         const shouldSendLongTermMemory =
           modelConfig.sendMemory &&
           session.memoryPrompt &&
           session.memoryPrompt.length > 0 &&
-          session.lastSummarizeIndex <= clearContextIndex;
-        const longTermMemoryPrompts = shouldSendLongTermMemory
-          ? [get().getMemoryPrompt()]
-          : [];
+          session.lastSummarizeIndex > clearContextIndex;
+        const longTermMemoryPrompts =
+          shouldSendLongTermMemory && memoryPrompt ? [memoryPrompt] : [];
         const longTermMemoryStartIndex = session.lastSummarizeIndex;
 
         // short term memory
@@ -409,6 +484,7 @@ export const useChatStore = create<ChatStore>()(
         );
 
         // lets concat send messages, including 4 parts:
+        // 0. system prompt: to get close to OpenAI Web ChatGPT
         // 1. long term memory: summarized memory messages
         // 2. pre-defined in-context prompts
         // 3. short term memory: latest n messages
@@ -429,12 +505,12 @@ export const useChatStore = create<ChatStore>()(
         ) {
           const msg = messages[i];
           if (!msg || msg.isError) continue;
-          tokenCount += estimateTokenLength(msg.content);
+          tokenCount += estimateTokenLength(getMessageTextContent(msg));
           reversedRecentMessages.push(msg);
         }
-
         // concat all messages
         const recentMessages = [
+          ...systemPrompts,
           ...longTermMemoryPrompts,
           ...contextPrompts,
           ...reversedRecentMessages.reverse(),
@@ -463,7 +539,16 @@ export const useChatStore = create<ChatStore>()(
       },
 
       summarizeSession() {
+        const config = useAppConfig.getState();
         const session = get().currentSession();
+        const modelConfig = session.mask.modelConfig;
+        // skip summarize when using dalle3?
+        if (isDalle3(modelConfig.model)) {
+          return;
+        }
+
+        const providerName = modelConfig.providerName;
+        const api: ClientApi = getClientApi(providerName);
 
         // remove error messages if any
         const messages = session.messages;
@@ -471,6 +556,7 @@ export const useChatStore = create<ChatStore>()(
         // should summarize topic after chating more than 50 words
         const SUMMARIZE_MIN_LEN = 50;
         if (
+          config.enableAutoGenerateTitle &&
           session.topic === DEFAULT_TOPIC &&
           countMessages(messages) >= SUMMARIZE_MIN_LEN
         ) {
@@ -483,7 +569,9 @@ export const useChatStore = create<ChatStore>()(
           api.llm.chat({
             messages: topicMessages,
             config: {
-              model: "gpt-3.5-turbo",
+              model: getSummarizeModel(session.mask.modelConfig.model),
+              stream: false,
+              providerName,
             },
             onFinish(message) {
               get().updateCurrentSession(
@@ -494,8 +582,6 @@ export const useChatStore = create<ChatStore>()(
             },
           });
         }
-
-        const modelConfig = session.mask.modelConfig;
         const summarizeIndex = Math.max(
           session.lastSummarizeIndex,
           session.clearContextIndex ?? 0,
@@ -512,9 +598,11 @@ export const useChatStore = create<ChatStore>()(
             Math.max(0, n - modelConfig.historyMessageCount),
           );
         }
-
-        // add memory prompt
-        toBeSummarizedMsgs.unshift(get().getMemoryPrompt());
+        const memoryPrompt = get().getMemoryPrompt();
+        if (memoryPrompt) {
+          // add memory prompt
+          toBeSummarizedMsgs.unshift(memoryPrompt);
+        }
 
         const lastSummarizeIndex = session.messages.length;
 
@@ -529,19 +617,32 @@ export const useChatStore = create<ChatStore>()(
           historyMsgLength > modelConfig.compressMessageLengthThreshold &&
           modelConfig.sendMemory
         ) {
+          /** Destruct max_tokens while summarizing
+           * this param is just shit
+           **/
+          const { max_tokens, ...modelcfg } = modelConfig;
           api.llm.chat({
-            messages: toBeSummarizedMsgs.concat({
-              role: "system",
-              content: Locale.Store.Prompt.Summarize,
-              date: "",
-            }),
-            config: { ...modelConfig, stream: true },
+            messages: toBeSummarizedMsgs.concat(
+              createMessage({
+                role: "system",
+                content: Locale.Store.Prompt.Summarize,
+                date: "",
+              }),
+            ),
+            config: {
+              ...modelcfg,
+              stream: true,
+              model: getSummarizeModel(session.mask.modelConfig.model),
+            },
             onUpdate(message) {
               session.memoryPrompt = message;
             },
             onFinish(message) {
               console.log("[Memory] ", message);
-              session.lastSummarizeIndex = lastSummarizeIndex;
+              get().updateCurrentSession((session) => {
+                session.lastSummarizeIndex = lastSummarizeIndex;
+                session.memoryPrompt = message; // Update the memory prompt for stored it in local storage
+              });
             },
             onError(err) {
               console.error("[Summarize] ", err);
@@ -550,14 +651,14 @@ export const useChatStore = create<ChatStore>()(
         }
       },
 
-      updateStat(message) {
+      updateStat(message: ChatMessage) {
         get().updateCurrentSession((session) => {
           session.stat.charCount += message.content.length;
           // TODO: should update chat count and word count
         });
       },
 
-      updateCurrentSession(updater) {
+      updateCurrentSession(updater: (session: ChatSession) => void) {
         const sessions = get().sessions;
         const index = get().currentSessionIndex;
         updater(sessions[index]);
@@ -568,32 +669,60 @@ export const useChatStore = create<ChatStore>()(
         localStorage.clear();
         location.reload();
       },
-    }),
-    {
-      name: StoreKey.Chat,
-      version: 2,
-      migrate(persistedState, version) {
-        const state = persistedState as any;
-        const newState = JSON.parse(JSON.stringify(state)) as ChatStore;
+    };
 
-        if (version < 2) {
-          newState.globalId = 0;
-          newState.sessions = [];
+    return methods;
+  },
+  {
+    name: StoreKey.Chat,
+    version: 3.1,
+    migrate(persistedState, version) {
+      const state = persistedState as any;
+      const newState = JSON.parse(
+        JSON.stringify(state),
+      ) as typeof DEFAULT_CHAT_STATE;
 
-          const oldSessions = state.sessions;
-          for (const oldSession of oldSessions) {
-            const newSession = createEmptySession();
-            newSession.topic = oldSession.topic;
-            newSession.messages = [...oldSession.messages];
-            newSession.mask.modelConfig.sendMemory = true;
-            newSession.mask.modelConfig.historyMessageCount = 4;
-            newSession.mask.modelConfig.compressMessageLengthThreshold = 1000;
-            newState.sessions.push(newSession);
-          }
+      if (version < 2) {
+        newState.sessions = [];
+
+        const oldSessions = state.sessions;
+        for (const oldSession of oldSessions) {
+          const newSession = createEmptySession();
+          newSession.topic = oldSession.topic;
+          newSession.messages = [...oldSession.messages];
+          newSession.mask.modelConfig.sendMemory = true;
+          newSession.mask.modelConfig.historyMessageCount = 4;
+          newSession.mask.modelConfig.compressMessageLengthThreshold = 1000;
+          newState.sessions.push(newSession);
         }
+      }
 
-        return newState;
-      },
+      if (version < 3) {
+        // migrate id to nanoid
+        newState.sessions.forEach((s) => {
+          s.id = nanoid();
+          s.messages.forEach((m) => (m.id = nanoid()));
+        });
+      }
+
+      // Enable `enableInjectSystemPrompts` attribute for old sessions.
+      // Resolve issue of old sessions not automatically enabling.
+      if (version < 3.1) {
+        newState.sessions.forEach((s) => {
+          if (
+            // Exclude those already set by user
+            !s.mask.modelConfig.hasOwnProperty("enableInjectSystemPrompts")
+          ) {
+            // Because users may have changed this configuration,
+            // the user's current configuration is used instead of the default
+            const config = useAppConfig.getState();
+            s.mask.modelConfig.enableInjectSystemPrompts =
+              config.modelConfig.enableInjectSystemPrompts;
+          }
+        });
+      }
+
+      return newState as any;
     },
-  ),
+  },
 );
